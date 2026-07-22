@@ -316,26 +316,33 @@ def users_from_message(message: Message) -> list[int]:
 
 async def parse_roles(message: Message) -> dict[str, Any]:
     text = message.text or ""
-    ids = users_from_message(message)
+    ids = [
+        entity.user.id
+        for entity in message.entities or []
+        if entity.type == "text_mention" and entity.user
+    ]
     mentions = re.findall(r"@[\w_]{2,}", text)
-    # Telegram does not expose arbitrary @username IDs without entity data.
-    # Reply/text_mention are therefore preferred; this also avoids guessing users.
     role_ids: dict[str, int | None] = {"plaintiff_id": None, "defendant_id": None, "judge_id": None}
     witness_ids: list[int] = []
-    labels = {
-        "истец": "plaintiff_id", "истица": "plaintiff_id",
-        "ответчик": "defendant_id", "ответчица": "defendant_id",
-        "судья": "judge_id",
-    }
-    for label, key in labels.items():
-        match = re.search(label + r"\s*:\s*", text.lower())
-        if match:
-            index = len([v for v in role_ids.values() if v])
-            if index < len(ids):
-                role_ids[key] = ids[index]
-    witness_count = len(re.findall(r"свидетел", text.lower()))
-    if witness_count and len(ids) > 3:
-        witness_ids = ids[3:8]
+    role_sequence: list[str] = []
+    for label in re.findall(
+        r"(истец|истица|ответчик|ответчица|свидетел(?:ь|я|ей)?|судья)\s*:",
+        text.lower(),
+    ):
+        if label.startswith("ист"):
+            role_sequence.append("plaintiff_id")
+        elif label.startswith("ответ"):
+            role_sequence.append("defendant_id")
+        elif label.startswith("суд"):
+            role_sequence.append("judge_id")
+        else:
+            role_sequence.append("witnesses")
+    for key, user_id in zip(role_sequence, ids):
+        if key == "witnesses":
+            if len(witness_ids) < 5:
+                witness_ids.append(user_id)
+        elif role_ids[key] is None:
+            role_ids[key] = user_id
     if not role_ids["plaintiff_id"] and ids:
         role_ids["plaintiff_id"] = ids[0]
     if not role_ids["defendant_id"] and len(ids) > 1:
@@ -411,6 +418,9 @@ async def status(message: Message) -> None:
 
 @router.message(F.text)
 async def lawsuit(message: Message, state: FSMContext) -> None:
+    if await state.get_state() == CaseStates.waiting_for_roles.state:
+        await receive_roles(message, state)
+        return
     command = clean_command(message.text)
     active = db.active_case(message.chat.id) if message.chat.type != ChatType.PRIVATE else None
     if active and active["state"] == "active" and message.from_user:
