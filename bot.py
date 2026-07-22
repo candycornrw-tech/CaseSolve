@@ -31,9 +31,32 @@ class Database:
                 complainant_id INTEGER NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS users (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                PRIMARY KEY (chat_id, user_id)
+            );
             """
         )
         self.connection.commit()
+
+    def remember_user(self, chat_id: int, user_id: int, username: str | None) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO users(chat_id,user_id,username) VALUES(?,?,?)
+            ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username
+            """,
+            (chat_id, user_id, username.lower() if username else None),
+        )
+        self.connection.commit()
+
+    def user_by_username(self, chat_id: int, username: str) -> int | None:
+        row = self.connection.execute(
+            "SELECT user_id FROM users WHERE chat_id=? AND username=?",
+            (chat_id, username.lower().lstrip("@")),
+        ).fetchone()
+        return int(row["user_id"]) if row else None
 
     def settings(self, chat_id: int) -> sqlite3.Row | None:
         return self.connection.execute("SELECT * FROM settings WHERE chat_id=?", (chat_id,)).fetchone()
@@ -316,11 +339,15 @@ def users_from_message(message: Message) -> list[int]:
 
 async def parse_roles(message: Message) -> dict[str, Any]:
     text = message.text or ""
-    ids = [
-        entity.user.id
-        for entity in message.entities or []
-        if entity.type == "text_mention" and entity.user
-    ]
+    ids: list[int] = []
+    for entity in message.entities or []:
+        if entity.type == "text_mention" and entity.user:
+            ids.append(entity.user.id)
+        elif entity.type == "mention":
+            username = text[entity.offset + 1 : entity.offset + entity.length]
+            found = db.user_by_username(message.chat.id, username)
+            if found:
+                ids.append(found)
     mentions = re.findall(r"@[\w_]{2,}", text)
     role_ids: dict[str, int | None] = {"plaintiff_id": None, "defendant_id": None, "judge_id": None}
     witness_ids: list[int] = []
@@ -352,6 +379,11 @@ async def parse_roles(message: Message) -> dict[str, Any]:
     role_ids["witnesses"] = witness_ids
     role_ids["mentions"] = mentions
     return role_ids
+
+
+def remember_sender(message: Message) -> None:
+    if message.chat.type != ChatType.PRIVATE and message.from_user:
+        db.remember_user(message.chat.id, message.from_user.id, message.from_user.username)
 
 
 @router.message(CommandStart())
@@ -418,6 +450,7 @@ async def status(message: Message) -> None:
 
 @router.message(F.text)
 async def lawsuit(message: Message, state: FSMContext) -> None:
+    remember_sender(message)
     if await state.get_state() == CaseStates.waiting_for_roles.state:
         await receive_roles(message, state)
         return
@@ -531,11 +564,18 @@ async def witnesses(message: Message) -> None:
 
 @router.message(CaseStates.waiting_for_roles)
 async def receive_roles(message: Message, state: FSMContext) -> None:
+    remember_sender(message)
     if not message.from_user or not await is_admin(message, message.from_user.id):
         return
     roles = await parse_roles(message)
     if not roles["plaintiff_id"] or not roles["defendant_id"]:
-        await message.answer("❕️ Не хватает Истца или Ответчика. Используйте Telegram-упоминания или ответьте на сообщения участников.")
+        await message.answer(
+            "❕️ Не хватает Истца или Ответчика.\n\n"
+            "Telegram передаёт ID только для выбранного упоминания. "
+            "Попросите Истца и Ответчика один раз написать сообщение в этой группе, "
+            "затем повторите шаблон. Также можно ответить на сообщение участника "
+            "или выбрать пользователя из подсказки Telegram."
+        )
         return
     settings = db.settings(message.chat.id)
     if not settings:
