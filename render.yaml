@@ -3,7 +3,7 @@ services:
     name: casesolve-telegram-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m bot.main
+    startCommand: python bot.py
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
