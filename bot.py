@@ -344,7 +344,9 @@ async def parse_roles(message: Message) -> dict[str, Any]:
         if entity.type == "text_mention" and entity.user:
             ids.append(entity.user.id)
         elif entity.type == "mention":
-            username = text[entity.offset + 1 : entity.offset + entity.length]
+            # Telegram offsets are UTF-16 offsets; use aiogram's extractor
+            # instead of Python slicing (Cyrillic text shifts the position).
+            username = entity.extract_from(text).lstrip("@")
             found = db.user_by_username(message.chat.id, username)
             if found:
                 ids.append(found)
@@ -732,6 +734,24 @@ async def facts_loop(bot: Bot) -> None:
                 logging.exception("Could not send fact")
 
 
+async def keep_alive() -> None:
+    """Простой HTTP-сервер чтобы Render не усыплял бота."""
+    from aiohttp import web
+
+    async def health(request: web.Request) -> web.Response:
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    port = int(os.getenv("PORT", "8080"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info("Keep-alive HTTP server started on port %d", port)
+
+
 async def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -739,6 +759,7 @@ async def main() -> None:
     bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
+    await keep_alive()
     asyncio.create_task(facts_loop(bot))
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
