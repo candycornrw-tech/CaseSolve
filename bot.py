@@ -458,6 +458,21 @@ async def begin_court(bot: Bot, case_id: int, court_id: int) -> None:
     witness_lines = "".join(
         f"\nСвидетель: <a href='tg://user?id={w}'>участник</a>" for w in witnesses
     )
+
+    # Создаём одноразовую ссылку-приглашение в судебный чат
+    invite_link: str | None = None
+    if court_id != case["source_chat_id"]:
+        try:
+            link_obj = await bot.create_chat_invite_link(
+                court_id,
+                name=f"Суд №{case_id}",
+                member_limit=20,
+            )
+            invite_link = link_obj.invite_link
+        except Exception:
+            invite_link = None
+
+    # Сообщение о начале суда в судебном чате
     await bot.send_message(
         court_id,
         f"⚖️ <b>Суд №{case_id} начинается.</b>\n\n"
@@ -465,9 +480,32 @@ async def begin_court(bot: Bot, case_id: int, court_id: int) -> None:
         f"Ответчик: <a href='tg://user?id={case['defendant_id']}'>участник</a>"
         f"{witness_lines}\n\n"
         "Судья может говорить в любой момент.\n"
-        "Истец и ответчик выступают по очереди.",
+        "Истец и ответчик выступают <b>по очереди</b>.\n"
+        "Первым слово предоставляется <b>Истцу</b>.",
         reply_markup=judge_markup(case_id),
     )
+
+    # Уведомляем участников в исходном чате и присылаем ссылку
+    if invite_link:
+        invite_text = (
+            f"⚖️ <b>Суд №{case_id} создан.</b>\n\n"
+            f"Все участники приглашаются в судебный чат:\n{invite_link}\n\n"
+            "Истец, Ответчик, Свидетели и Судья — пожалуйста, перейдите по ссылке."
+        )
+    else:
+        invite_text = (
+            f"⚖️ <b>Суд №{case_id} начался в судебном чате.</b>\n"
+            "Участники, перейдите в чат для судов."
+        )
+
+    source_id = case["source_chat_id"]
+    if source_id and source_id != court_id:
+        try:
+            await bot.send_message(source_id, invite_text)
+        except Exception:
+            pass
+
+    # Мутим всех в судебном чате, кроме истца и судьи
     await apply_permissions(bot, case, "plaintiff")
 
 
@@ -616,21 +654,38 @@ async def text_dispatcher(message: Message, state: FSMContext) -> None:
                 await begin_court(message.bot, int(ready["id"]), court_id)
                 return
 
-    # 2. Очередь выступлений в активном суде
+    # 2. Очередь выступлений — работает только в судебном чате
     if message.chat.type != ChatType.PRIVATE:
         active = db.active_case(message.chat.id)
         if active and active["state"] == "active":
-            uid = message.from_user.id
-            if uid == active["plaintiff_id"] and active["turn"] == "plaintiff":
-                db.update_case(active["id"], turn="defendant")
-                await apply_permissions(message.bot, active, "defendant")
-                await message.answer("⚖️ Слово передаётся <b>Ответчику</b>.")
-                return
-            if uid == active["defendant_id"] and active["turn"] == "defendant":
-                db.update_case(active["id"], turn="plaintiff")
-                await apply_permissions(message.bot, active, "plaintiff")
-                await message.answer("⚖️ Слово снова передаётся <b>Истцу</b>.")
-                return
+            # Обрабатываем только сообщения именно из судебного чата
+            if message.chat.id == active["court_chat_id"]:
+                uid = message.from_user.id
+                if uid == active["plaintiff_id"] and active["turn"] == "plaintiff":
+                    # Мутим истца сразу, передаём слово ответчику
+                    muted = ChatPermissions(can_send_messages=False)
+                    try:
+                        await message.bot.restrict_chat_member(message.chat.id, uid, muted)
+                    except Exception:
+                        pass
+                    db.update_case(active["id"], turn="defendant")
+                    # Перечитываем обновлённое дело для apply_permissions
+                    active = db.case(active["id"])
+                    await apply_permissions(message.bot, active, "defendant")
+                    await message.answer("⚖️ Слово передаётся <b>Ответчику</b>.")
+                    return
+                if uid == active["defendant_id"] and active["turn"] == "defendant":
+                    # Мутим ответчика сразу, передаём слово истцу
+                    muted = ChatPermissions(can_send_messages=False)
+                    try:
+                        await message.bot.restrict_chat_member(message.chat.id, uid, muted)
+                    except Exception:
+                        pass
+                    db.update_case(active["id"], turn="plaintiff")
+                    active = db.case(active["id"])
+                    await apply_permissions(message.bot, active, "plaintiff")
+                    await message.answer("⚖️ Слово снова передаётся <b>Истцу</b>.")
+                    return
 
     # 3. Команды суда (! Суд / /lawsuit)
     command = clean_command(text)
